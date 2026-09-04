@@ -1,25 +1,38 @@
-require("dotenv").config();
-
-const {
+import "dotenv/config";
+import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-} = require("discord.js");
+} from "discord.js";
 
 const PREFIX = "-";
+const TOKEN = process.env.TOKEN;
+const INVITE = process.env.INVITE;
 
-if (!process.env.TOKEN) {
-  console.error("Missing TOKEN in .env");
+// ==============================
+// STARTUP CHECKS
+// ==============================
+
+console.log("Starting TitanBot...");
+
+if (!TOKEN) {
+  console.error("❌ ERROR: TOKEN is missing.");
+  console.error("Add TOKEN to your environment variables.");
   process.exit(1);
 }
 
-if (!process.env.INVITE) {
-  console.error("Missing INVITE in .env");
+if (!INVITE) {
+  console.error("❌ ERROR: INVITE is missing.");
+  console.error("Add INVITE to your environment variables.");
   process.exit(1);
 }
+
+// ==============================
+// CLIENT
+// ==============================
 
 const client = new Client({
   intents: [
@@ -29,14 +42,22 @@ const client = new Client({
   ],
 });
 
-// Prevent repeated requests from the same user
-const cooldowns = new Map();
-const COOLDOWN = 60 * 1000;
+// ==============================
+// READY
+// ==============================
 
 client.once("ready", () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  console.log("Bot is online.");
+  console.log("================================");
+  console.log("TitanBot started successfully");
+  console.log(`Logged in as: ${client.user.tag}`);
+  console.log(`Prefix: ${PREFIX}`);
+  console.log("Status: ONLINE");
+  console.log("================================");
 });
+
+// ==============================
+// COMMANDS
+// ==============================
 
 client.on("messageCreate", async (message) => {
   try {
@@ -44,11 +65,11 @@ client.on("messageCreate", async (message) => {
     if (!message.guild) return;
     if (!message.content.startsWith(PREFIX)) return;
 
-    const args = message.content
-      .slice(PREFIX.length)
-      .trim()
-      .split(/\s+/);
+    const content = message.content.slice(PREFIX.length).trim();
 
+    if (!content) return;
+
+    const args = content.split(/\s+/);
     const command = args.shift()?.toLowerCase();
 
     if (command !== "invite") return;
@@ -56,7 +77,7 @@ client.on("messageCreate", async (message) => {
     const embed = new EmbedBuilder()
       .setTitle("Server Invite")
       .setDescription(
-        "Click the button below to request the server invite in your DMs."
+        "Click the button below if you want the server invite sent to your DMs."
       );
 
     const button = new ButtonBuilder()
@@ -75,27 +96,17 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// ==============================
+// BUTTONS
+// ==============================
+
 client.on("interactionCreate", async (interaction) => {
   try {
     if (!interaction.isButton()) return;
-    if (interaction.customId !== "request_server_invite") return;
 
-    const userId = interaction.user.id;
-    const now = Date.now();
-    const lastRequest = cooldowns.get(userId);
-
-    if (lastRequest && now - lastRequest < COOLDOWN) {
-      const remaining = Math.ceil(
-        (COOLDOWN - (now - lastRequest)) / 1000
-      );
-
-      return interaction.reply({
-        content: `Please wait ${remaining} seconds before requesting another invite.`,
-        ephemeral: true,
-      });
+    if (interaction.customId !== "request_server_invite") {
+      return;
     }
-
-    cooldowns.set(userId, now);
 
     await interaction.deferReply({
       ephemeral: true,
@@ -103,44 +114,74 @@ client.on("interactionCreate", async (interaction) => {
 
     try {
       await interaction.user.send(
-        `You requested the server invite:\n${process.env.INVITE}`
+        `You requested the server invite:\n${INVITE}`
       );
 
       await interaction.editReply({
-        content: "The invite was sent to your DMs.",
+        content: "✅ The invite was sent to your DMs.",
       });
     } catch (error) {
-      console.error("DM failed:", error);
+      console.error("DM error:", error);
 
       await interaction.editReply({
         content:
-          "I couldn't DM you. Please make sure your Discord settings allow DMs.",
+          "❌ I couldn't send you a DM. Check your Discord privacy settings.",
       });
     }
   } catch (error) {
     console.error("Interaction error:", error);
+
+    try {
+      if (interaction.deferred) {
+        await interaction.editReply({
+          content: "❌ Something went wrong. Please try again.",
+        });
+      } else if (!interaction.replied) {
+        await interaction.reply({
+          content: "❌ Something went wrong. Please try again.",
+          ephemeral: true,
+        });
+      }
+    } catch (replyError) {
+      console.error("Interaction reply error:", replyError);
+    }
   }
 });
 
+// ==============================
+// DISCORD ERRORS
+// ==============================
+
 client.on("error", (error) => {
-  console.error("Discord error:", error);
+  console.error("Discord client error:", error);
 });
 
 client.on("warn", (warning) => {
   console.warn("Discord warning:", warning);
 });
 
+// ==============================
+// PROCESS ERRORS
+// ==============================
+
 process.on("unhandledRejection", (error) => {
-  console.error("Unhandled rejection:", error);
+  console.error("Unhandled promise rejection:", error);
 });
 
 process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", error);
 });
 
-client
-  .login(process.env.TOKEN)
-  .catch((error) => {
-    console.error("Login failed:", error.message);
-    process.exit(1);
-  });
+// ==============================
+// LOGIN
+// ==============================
+
+console.log("Connecting to Discord...");
+
+try {
+  await client.login(TOKEN);
+} catch (error) {
+  console.error("❌ Discord login failed.");
+  console.error(error);
+  process.exit(1);
+}
