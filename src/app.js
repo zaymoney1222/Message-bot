@@ -1,431 +1,704 @@
-﻿import 'dotenv/config';
-import { Client, Collection, GatewayIntentBits } from 'discord.js';
-import { REST } from '@discordjs/rest';
-import express from 'express';
-import cron from 'node-cron';
+require("dotenv").config();
 
-import config from './config/application.js';
-import { initializeDatabase } from './utils/database.js';
-import { getGuildConfig } from './services/config/guildConfig.js';
-import { getServerCounters, saveServerCounters, updateCounter } from './services/serverstatsService.js';
-import { logger, startupLog, shutdownLog } from './utils/logger.js';
-import { checkBirthdays } from './services/birthdayService.js';
-import { checkGiveaways } from './services/giveawayService.js';
-import { loadCommands, registerCommands as registerSlashCommands } from './handlers/loaders/commandLoader.js';
-import { runSafeTask, handleTaskError, ErrorCodes } from './utils/errorHandler.js';
-import { initializeMusic } from './services/music/riffySetup.js';
-import { shutdownMusic } from './services/music/playerHandler.js';
-import pkg from '../package.json' with { type: 'json' };
-import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
+const {
+    Client,
+    GatewayIntentBits,
+    Partials,
+    EmbedBuilder,
+    PermissionsBitField
+} = require("discord.js");
 
-class TitanBot extends Client {
-  constructor() {
-    super({
-      intents: [
-        
-        GatewayIntentBits.Guilds,                        
-        GatewayIntentBits.GuildMembers,                 
+/*
+==================================================
+CONFIG
+==================================================
+*/
 
-        GatewayIntentBits.GuildMessages,                
-        GatewayIntentBits.GuildMessageReactions,        
-        GatewayIntentBits.MessageContent,               
-        GatewayIntentBits.DirectMessages,
+const PREFIX = process.env.PREFIX || "-";
 
-        GatewayIntentBits.GuildVoiceStates,             
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages
+    ],
+    partials: [
+        Partials.Channel
+    ]
+});
 
-        GatewayIntentBits.GuildBans,                    
-      ],
-    });
+/*
+==================================================
+STORAGE
+==================================================
+*/
 
-    this.config = config;
-    this.commands = new Collection();
-    this.events = new Collection();
-    this.buttons = new Collection();
-    this.selectMenus = new Collection();
-    this.modals = new Collection();
-    this.cooldowns = new Collection();
-    this.db = null;
-    this.rest = new REST({ version: '10' }).setToken(config.bot.token);
-  }
+// Users who opted into promotional DMs
+const promoOptIn = new Set();
 
-  async start() {
-    try {
-      startupLog('Starting TitanBot...');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      startupLog('Initializing database...');
-      const dbInstance = await initializeDatabase();
-      this.db = dbInstance.db;
+// Promo message for each server
+const promoMessages = new Map();
 
-      // Check database status and report
-      const dbStatus = this.db.getStatus();
-      if (dbStatus.isDegraded) {
-        logger.warn('');
-        logger.warn('╔═══════════════════════════════════════════════════════╗');
-        logger.warn('║ ⚠️  DATABASE RUNNING IN DEGRADED MODE                 ║');
-        logger.warn('║                                                       ║');
-        logger.warn('║ Connection: In-Memory Storage (PostgreSQL unavailable)║');
-        logger.warn('║ Data Persistence: DISABLED - data lost on restart    ║');
-        logger.warn('║ Action Required: Fix PostgreSQL and restart bot      ║');
-        logger.warn('╚═══════════════════════════════════════════════════════╝');
-        logger.warn('');
-      } else {
-        startupLog(`✅ Database Status: ${dbStatus.connectionType} (fully operational)`);
-      }
-      
-      startupLog('Starting web server...');
-      this.startWebServer();
-      
-      startupLog('Loading commands...');
-      await loadCommands(this);
-      startupLog(`Commands loaded: ${this.commands.size}`);
-      
-      startupLog('Loading handlers...');
-      await this.loadHandlers();
-      startupLog('Handlers loaded');
+// Cooldowns
+const cooldowns = new Map();
 
-      initializeMusic(this);
-      
-      startupLog('Logging into Discord...');
-      await this.login(this.config.bot.token);
-      startupLog('Discord login successful');
-      
-      startupLog('Registering slash commands globally...');
-      await this.registerCommands();
-      startupLog('Slash commands registration complete');
-      
-      const databaseMode = dbStatus.isDegraded
-        ? 'Optional in-memory mode (data resets after restart)'
-        : 'Connected (persistent data enabled)';
-      const handlerSummary = `${this.buttons.size} buttons, ${this.selectMenus.size} menus, ${this.modals.size} modals`;
-      startupLog(
-        `ONLINE ✅ | ${this.commands.size} commands loaded | ${handlerSummary} | Database: ${databaseMode}`
-      );
-      
-      this.setupCronJobs();
-    } catch (error) {
-      logger.error('Failed to start bot:', error);
-      process.exit(1);
+// Confirmation requests
+const confirmations = new Map();
+
+/*
+==================================================
+SETTINGS
+==================================================
+*/
+
+const BOOST_COOLDOWN = 60 * 60 * 1000;
+const INVITE_COOLDOWN = 5 * 60 * 1000;
+const DM_DELAY = 1500;
+
+/*
+==================================================
+HELPERS
+==================================================
+*/
+
+function makeEmbed(title, description) {
+    return new EmbedBuilder()
+        .setTitle(title)
+        .setDescription(description)
+        .setTimestamp();
+}
+
+function hasCooldown(userId, command) {
+    const key = `${userId}:${command}`;
+    const expires = cooldowns.get(key);
+
+    if (!expires) {
+        return false;
     }
-  }
 
-  startWebServer() {
-    const app = express();
-    const configuredPort = Number(this.config.api?.port || process.env.PORT || 3000);
-    const maxPortRetryAttempts = Number(process.env.PORT_RETRY_ATTEMPTS || 5);
-    const host = process.env.WEB_HOST || '0.0.0.0';
-    const corsOrigin = this.config.api?.cors?.origin || '*';
-    
-    app.use((req, res, next) => {
-      const allowedOrigins = Array.isArray(corsOrigin) ? corsOrigin : [corsOrigin];
-      const origin = req.headers.origin;
-      
-      if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin || '*');
-      }
-      res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-      
-      if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-      }
-      next();
-    });
-
-    const requestCounts = new Map();
-    const windowMs = this.config.api?.rateLimit?.windowMs || 60000;
-    const maxRequests = this.config.api?.rateLimit?.max || 100;
-    
-    app.use((req, res, next) => {
-      const ip = req.ip;
-      const now = Date.now();
-      const windowStart = now - windowMs;
-      
-      if (!requestCounts.has(ip)) {
-        requestCounts.set(ip, []);
-      }
-      
-      const times = requestCounts.get(ip).filter(t => t > windowStart);
-      
-      if (times.length >= maxRequests) {
-        return res.status(429).json({ error: 'Too many requests' });
-      }
-      
-      times.push(now);
-      requestCounts.set(ip, times);
-      next();
-    });
-
-    app.get('/health', (req, res) => {
-      const dbStatus = this.db?.getStatus?.() || { isDegraded: 'unknown' };
-      const status = {
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        database: {
-          connected: dbStatus.connectionType !== 'none',
-          degraded: dbStatus.isDegraded,
-          type: dbStatus.connectionType
-        }
-      };
-      res.status(200).json(status);
-    });
-
-    app.get('/ready', (req, res) => {
-      const dbStatus = this.db?.getStatus?.() || { isDegraded: true, connectionType: 'none' };
-      const isReady = this.isReady() && !dbStatus.isDegraded;
-
-      const metrics = {
-        guildCount: this.guilds?.cache?.size ?? 0,
-        commandCount: this.commands?.size ?? 0,
-        database: {
-          mode: dbStatus.connectionType,
-          degraded: dbStatus.isDegraded,
-          degradedReason: dbStatus.degradedReason ?? null,
-        },
-        schemaVersion: EXPECTED_SCHEMA_VERSION,
-        schemaLabel: EXPECTED_SCHEMA_LABEL,
-      };
-
-      if (isReady) {
-        return res.status(200).json({
-          ready: true,
-          message: 'Bot is ready',
-          metrics,
-        });
-      }
-
-      res.status(503).json({
-        ready: false,
-        reason: !this.isReady() ? 'Bot not Ready' : 'Database degraded',
-        metrics,
-      });
-    });
-
-    app.get('/', (req, res) => {
-      res.status(200).json({ 
-        message: 'TitanBot System Online',
-        version: pkg.version,
-        timestamp: new Date().toISOString()
-      });
-    });
-
-    const startServer = (port, attempt = 0) => {
-      let hasStartedListening = false;
-      const server = app.listen(port, host, () => {
-        hasStartedListening = true;
-        this.webServer = server;
-        startupLog(`✅ Web Server running on ${host}:${port}`);
-        startupLog(`Health endpoint: http://${host}:${port}/health`);
-        startupLog(`Ready endpoint: http://${host}:${port}/ready`);
-      });
-
-      server.on('error', (error) => {
-        const errorCode = error?.code || 'UNKNOWN_ERROR';
-        const errorMessage = error?.message || 'Unknown server error';
-
-        if (!hasStartedListening && errorCode === 'EADDRINUSE' && attempt < maxPortRetryAttempts) {
-          const nextPort = port + 1;
-          startupLog(`Port ${port} is already in use. Trying port ${nextPort}...`);
-          setTimeout(() => startServer(nextPort, attempt + 1), 250);
-          return;
-        }
-
-        if (hasStartedListening && errorCode === 'EADDRINUSE') {
-          logger.warn(`Web server reported a duplicate bind warning on ${host}:${port}, but the bot remains online.`);
-          return;
-        }
-
-        logger.error(`❌ Web server error on port ${port} (${errorCode}): ${errorMessage}`);
-
-        if (!hasStartedListening) {
-          process.exit(1);
-        }
-      });
-    };
-
-    startServer(configuredPort, 0);
-  }
-
-  setupCronJobs() {
-    cron.schedule('0 6 * * *', runSafeTask('birthday_check', () => checkBirthdays(this)));
-    cron.schedule('* * * * *', runSafeTask('giveaway_check', () => checkGiveaways(this)));
-    cron.schedule('*/15 * * * *', runSafeTask('counter_update', () => this.updateAllCounters()));
-  }
-
-  async updateAllCounters() {
-    if (!this.db) {
-      logger.warn('Database not available for counter updates');
-      return;
+    if (Date.now() >= expires) {
+        cooldowns.delete(key);
+        return false;
     }
-    
-    for (const [guildId, guild] of this.guilds.cache) {
-      try {
-        const counters = await getServerCounters(this, guildId);
-        const validCounters = [];
-        const orphanedCounters = [];
-        
-        for (const counter of counters) {
-          if (counter && counter.type && counter.channelId && counter.enabled !== false) {
-            const channel = guild.channels.cache.get(counter.channelId);
-            if (channel) {
-              validCounters.push(counter);
-              await updateCounter(this, guild, counter);
-            } else {
-              orphanedCounters.push(counter);
-              logger.info(`Removing orphaned counter ${counter.id} (type: ${counter.type}, deleted channel: ${counter.channelId}) from guild ${guildId}`);
+
+    return true;
+}
+
+function setCooldown(userId, command, duration) {
+    const key = `${userId}:${command}`;
+
+    cooldowns.set(
+        key,
+        Date.now() + duration
+    );
+}
+
+function isStaff(member) {
+    return member.permissions.has(
+        PermissionsBitField.Flags.ManageGuild
+    );
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function validDiscordInvite(invite) {
+    return /^https?:\/\/(www\.)?(discord\.gg|discord\.com\/invite)\/[A-Za-z0-9-]+$/i.test(
+        invite
+    );
+}
+
+/*
+==================================================
+READY
+==================================================
+*/
+
+client.once("ready", () => {
+    console.log("================================");
+    console.log("VC+ IS ONLINE");
+    console.log(`Bot: ${client.user.tag}`);
+    console.log(`Prefix: ${PREFIX}`);
+    console.log(`Servers: ${client.guilds.cache.size}`);
+    console.log("================================");
+
+    client.user.setPresence({
+        activities: [
+            {
+                name: `${PREFIX}help`,
+                type: 0
             }
-          }
-        }
-        
-        // Save cleaned counters if any were orphaned
-        // Save cleaned counters if any were orphaned
-        if (orphanedCounters.length > 0) {
-          await saveServerCounters(this, guildId, validCounters);
-          logger.info(`Cleaned up ${orphanedCounters.length} orphaned counter(s) from guild ${guildId} during scheduled update`);
-        }
-      } catch (error) {
-        logger.error(`Error updating counters for guild ${guildId}:`, error);
-      }
-    }
-  }
+        ],
+        status: "online"
+    });
+});
 
-  async loadHandlers() {
-    startupLog('Loading handlers...');
-    const handlers = [
-      { path: 'events', type: 'default', required: true },
-      { path: 'interactions', type: 'default', required: true }
-    ];
+/*
+==================================================
+MESSAGE HANDLER
+==================================================
+*/
 
-    for (const handler of handlers) {
-      try {
-        startupLog(`Loading handler: ${handler.path}`);
-        const module = await import(`./handlers/loaders/${handler.path}.js`);
-        const loaderFn = handler.type.startsWith('named:')
-          ? module[handler.type.split(':')[1]]
-          : module.default;
-
-        if (typeof loaderFn === 'function') {
-          await loaderFn(this);
-          startupLog(`✅ Loaded ${handler.path}`);
-        } else {
-          throw new Error(`Invalid loader export from ${handler.path}`);
-        }
-      } catch (error) {
-        if (handler.required) {
-          logger.error(`❌ Failed to load required handler ${handler.path}:`, error.message);
-          throw error;
-        } else if (error.code !== 'MODULE_NOT_FOUND') {
-          logger.warn(`⚠️  Failed to load optional handler ${handler.path}:`, error.message);
-        }
-      }
-    }
-  }
-
-  async registerCommands() {
+client.on("messageCreate", async message => {
     try {
-      await registerSlashCommands(this, { clientId: this.config.bot.clientId });
-    } catch (error) {
-      logger.error('Error registering commands:', error);
-    }
-  }
+        if (message.author.bot) return;
 
-  async shutdown(reason = 'UNKNOWN') {
-    shutdownLog(`Bot is shutting down (${reason})...`);
-    logger.info(`\n${'='.repeat(60)}`);
-    logger.info(`🛑 Graceful Shutdown Initiated (${reason})`);
-    logger.info(`${'='.repeat(60)}`);
+        if (!message.guild) return;
 
-    try {
-      
-      logger.info('Stopping cron jobs...');
-      cron.getTasks().forEach(task => task.stop());
-      logger.info('✅ Cron jobs stopped');
-
-      logger.info('Stopping music players...');
-      await shutdownMusic(this);
-      logger.info('✅ Music players stopped');
-
-      if (this.webServer) {
-        logger.info('Closing web server...');
-        await new Promise((resolve) => this.webServer.close(resolve));
-        logger.info('✅ Web server closed');
-      }
-
-      // Close database connection
-      // Close database connection
-      if (this.db && this.db.db) {
-        logger.info('Closing database connection...');
-        try {
-          if (this.db.db.pool) {
-            await this.db.db.pool.end();
-            logger.info('✅ Database connection closed');
-          }
-        } catch (error) {
-          logger.warn('Error closing database pool:', error.message);
+        if (!message.content.startsWith(PREFIX)) {
+            return;
         }
-      }
 
-      logger.info('Destroying Discord client...');
-      if (this.isReady()) {
-        try {
-          this.destroy();
-          logger.info('✅ Discord client destroyed');
-        } catch (error) {
+        const input = message.content
+            .slice(PREFIX.length)
+            .trim();
 
-          logger.warn('Discord client destroy warning (non-critical):', error.message);
+        if (!input) return;
+
+        const args = input.split(/\s+/);
+
+        const command = args
+            .shift()
+            .toLowerCase();
+
+        /*
+        ==========================================
+        HELP
+        ==========================================
+        */
+
+        if (command === "help") {
+            return message.reply({
+                embeds: [
+                    makeEmbed(
+                        "vc+ commands",
+                        [
+                            "**general**",
+                            `\`${PREFIX}help\` — show commands`,
+                            `\`${PREFIX}inv <invite>\` — show server invite`,
+                            `\`${PREFIX}boost\` — show boost message`,
+                            "",
+                            "**promo**",
+                            `\`${PREFIX}promo optin\` — opt into promo DMs`,
+                            `\`${PREFIX}promo optout\` — opt out`,
+                            `\`${PREFIX}promo status\` — check status`,
+                            `\`${PREFIX}promo message <text>\` — set promo`,
+                            `\`${PREFIX}promo send\` — prepare promo`,
+                            `\`${PREFIX}promo send confirm\` — send promo`
+                        ].join("\n")
+                    )
+                ]
+            });
         }
-      }
 
-      logger.info('✅ Graceful shutdown complete');
-  shutdownLog('Bot stopped successfully.');
-      process.exit(0);
+        /*
+        ==========================================
+        -INV
+        ==========================================
+        */
+
+        if (command === "inv") {
+            const invite = args[0];
+
+            if (!invite) {
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "invalid usage",
+                            `use:\n\`${PREFIX}inv https://discord.gg/yourinvite\``
+                        )
+                    ]
+                });
+            }
+
+            if (!validDiscordInvite(invite)) {
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "invalid invite",
+                            "please provide a valid Discord invite link."
+                        )
+                    ]
+                });
+            }
+
+            if (
+                hasCooldown(
+                    message.author.id,
+                    "inv"
+                )
+            ) {
+                return message.reply(
+                    "you already used this command recently."
+                );
+            }
+
+            setCooldown(
+                message.author.id,
+                "inv",
+                INVITE_COOLDOWN
+            );
+
+            return message.reply({
+                embeds: [
+                    makeEmbed(
+                        "server invite",
+                        [
+                            "pull up and join the community.",
+                            "",
+                            `**invite:** ${invite}`
+                        ].join("\n")
+                    )
+                ]
+            });
+        }
+
+        /*
+        ==========================================
+        -BOOST
+        ==========================================
+        */
+
+        if (command === "boost") {
+            if (
+                hasCooldown(
+                    message.author.id,
+                    "boost"
+                )
+            ) {
+                return message.reply(
+                    "you already used this command recently."
+                );
+            }
+
+            setCooldown(
+                message.author.id,
+                "boost",
+                BOOST_COOLDOWN
+            );
+
+            return message.reply({
+                embeds: [
+                    makeEmbed(
+                        "support the server",
+                        [
+                            "enjoying the community?",
+                            "",
+                            "consider boosting the server to support us.",
+                            "",
+                            "every boost helps."
+                        ].join("\n")
+                    )
+                ]
+            });
+        }
+
+        /*
+        ==========================================
+        PROMO COMMAND
+        ==========================================
+        */
+
+        if (command === "promo") {
+            const subcommand = args
+                .shift()
+                ?.toLowerCase();
+
+            /*
+            --------------------------------------
+            OPT IN
+            --------------------------------------
+            */
+
+            if (subcommand === "optin") {
+                promoOptIn.add(
+                    message.author.id
+                );
+
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "promo enabled",
+                            [
+                                "you are now opted in to promotional DMs.",
+                                "",
+                                `use \`${PREFIX}promo optout\` anytime to stop them.`
+                            ].join("\n")
+                        )
+                    ]
+                });
+            }
+
+            /*
+            --------------------------------------
+            OPT OUT
+            --------------------------------------
+            */
+
+            if (subcommand === "optout") {
+                promoOptIn.delete(
+                    message.author.id
+                );
+
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "promo disabled",
+                            "you will no longer receive promotional DMs."
+                        )
+                    ]
+                });
+            }
+
+            /*
+            --------------------------------------
+            STATUS
+            --------------------------------------
+            */
+
+            if (subcommand === "status") {
+                const optedIn = promoOptIn.has(
+                    message.author.id
+                );
+
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "promo status",
+                            `you are currently **${
+                                optedIn
+                                    ? "opted in"
+                                    : "opted out"
+                            }**.`
+                        )
+                    ]
+                });
+            }
+
+            /*
+            --------------------------------------
+            SET MESSAGE
+            --------------------------------------
+            */
+
+            if (subcommand === "message") {
+                if (!isStaff(message.member)) {
+                    return message.reply(
+                        "you need **Manage Server** to use this command."
+                    );
+                }
+
+                const text = args.join(" ").trim();
+
+                if (!text) {
+                    return message.reply(
+                        `usage: \`${PREFIX}promo message <text>\``
+                    );
+                }
+
+                promoMessages.set(
+                    message.guild.id,
+                    text
+                );
+
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "promo message saved",
+                            [
+                                "**message:**",
+                                "",
+                                text
+                            ].join("\n")
+                        )
+                    ]
+                });
+            }
+
+            /*
+            --------------------------------------
+            SEND
+            --------------------------------------
+            */
+
+            if (subcommand === "send") {
+                if (!isStaff(message.member)) {
+                    return message.reply(
+                        "you need **Manage Server** to use this command."
+                    );
+                }
+
+                const promo =
+                    promoMessages.get(
+                        message.guild.id
+                    );
+
+                if (!promo) {
+                    return message.reply(
+                        `set a message first with \`${PREFIX}promo message <text>\``
+                    );
+                }
+
+                if (
+                    args[0]?.toLowerCase() ===
+                    "confirm"
+                ) {
+                    return sendPromo(
+                        message,
+                        promo
+                    );
+                }
+
+                confirmations.set(
+                    message.author.id,
+                    {
+                        guildId:
+                            message.guild.id,
+                        expires:
+                            Date.now() + 30000
+                    }
+                );
+
+                return message.reply({
+                    embeds: [
+                        makeEmbed(
+                            "promo confirmation",
+                            [
+                                "this will DM members who have explicitly opted in.",
+                                "",
+                                `run \`${PREFIX}promo send confirm\` within 30 seconds to continue.`
+                            ].join("\n")
+                        )
+                    ]
+                });
+            }
+
+            /*
+            --------------------------------------
+            PROMO HELP
+            --------------------------------------
+            */
+
+            return message.reply({
+                embeds: [
+                    makeEmbed(
+                        "promo commands",
+                        [
+                            `\`${PREFIX}promo optin\``,
+                            `\`${PREFIX}promo optout\``,
+                            `\`${PREFIX}promo status\``,
+                            `\`${PREFIX}promo message <text>\``,
+                            `\`${PREFIX}promo send\``,
+                            `\`${PREFIX}promo send confirm\``
+                        ].join("\n")
+                    )
+                ]
+            });
+        }
     } catch (error) {
-      logger.error('Error during graceful shutdown:', error);
-      process.exit(1);
+        console.error(
+            "MESSAGE HANDLER ERROR:",
+            error
+        );
+
+        if (
+            !message.replied &&
+            !message.deferred
+        ) {
+            await message.reply(
+                "something went wrong while running that command."
+            ).catch(() => {});
+        }
     }
-  }
+});
+
+/*
+==================================================
+PROMO SENDER
+==================================================
+*/
+
+async function sendPromo(message, promo) {
+    const confirmation =
+        confirmations.get(
+            message.author.id
+        );
+
+    if (!confirmation) {
+        return message.reply(
+            `run \`${PREFIX}promo send\` first.`
+        );
+    }
+
+    if (
+        confirmation.guildId !==
+        message.guild.id
+    ) {
+        confirmations.delete(
+            message.author.id
+        );
+
+        return message.reply(
+            "that confirmation is invalid."
+        );
+    }
+
+    if (
+        Date.now() >
+        confirmation.expires
+    ) {
+        confirmations.delete(
+            message.author.id
+        );
+
+        return message.reply(
+            "your confirmation expired."
+        );
+    }
+
+    confirmations.delete(
+        message.author.id
+    );
+
+    const members =
+        await message.guild.members.fetch();
+
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    const status =
+        await message.reply({
+            embeds: [
+                makeEmbed(
+                    "promo sending",
+                    "starting..."
+                )
+            ]
+        });
+
+    for (const [, member] of members) {
+        if (member.user.bot) {
+            skipped++;
+            continue;
+        }
+
+        if (!promoOptIn.has(member.id)) {
+            skipped++;
+            continue;
+        }
+
+        try {
+            await member.send({
+                embeds: [
+                    makeEmbed(
+                        message.guild.name,
+                        [
+                            promo,
+                            "",
+                            "you received this because you opted in to promotional messages.",
+                            "",
+                            `use \`${PREFIX}promo optout\` in the server to stop receiving these messages.`
+                        ].join("\n")
+                    )
+                ]
+            });
+
+            sent++;
+        } catch {
+            failed++;
+        }
+
+        await sleep(DM_DELAY);
+
+        if (
+            (sent + failed) % 10 ===
+            0
+        ) {
+            await status.edit({
+                embeds: [
+                    makeEmbed(
+                        "promo sending",
+                        [
+                            `**sent:** ${sent}`,
+                            `**failed:** ${failed}`,
+                            `**skipped:** ${skipped}`
+                        ].join("\n")
+                    )
+                ]
+            }).catch(() => {});
+        }
+    }
+
+    return status.edit({
+        embeds: [
+            makeEmbed(
+                "promo complete",
+                [
+                    `**sent:** ${sent}`,
+                    `**failed:** ${failed}`,
+                    `**skipped:** ${skipped}`,
+                    "",
+                    "only opted-in members were contacted."
+                ].join("\n")
+            )
+        ]
+    });
 }
 
-try {
-  const bot = new TitanBot();
-  
-  const setupShutdown = () => {
-    process.on('SIGTERM', () => bot.shutdown('SIGTERM'));
-    process.on('SIGINT', () => bot.shutdown('SIGINT'));
-    
-    process.on('uncaughtException', (error) => {
-      // Process state may be corrupt after an uncaught throw; log and shut down cleanly.
-      handleTaskError('uncaught_exception', error, { fatal: true });
-      bot.shutdown('UNCAUGHT_EXCEPTION');
-    });
+/*
+==================================================
+ERROR HANDLING
+==================================================
+*/
 
-    process.on('unhandledRejection', (reason) => {
-      const code = reason?.code;
-      if (code === 10062 || code === 40060 || code === 50027) {
-        logger.warn('Recoverable Discord interaction rejection:', reason?.message || reason);
-        return;
-      }
-      if (reason?.message?.includes('Queue is empty')) {
-        return;
-      }
+client.on(
+    "error",
+    error => {
+        console.error(
+            "DISCORD ERROR:",
+            error
+        );
+    }
+);
 
-      // A stray rejection is a bug to fix, not a reason to take the bot down.
-      // Log loudly with full context; the central task handler categorizes it.
-      handleTaskError('unhandled_rejection', reason instanceof Error ? reason : new Error(String(reason)), {
-        errorCode: ErrorCodes.UNHANDLED_REJECTION,
-      });
-    });
-  };
-  
-  setupShutdown();
-  bot.start().catch((error) => {
-    logger.error('Fatal error during bot startup:', error);
-    bot.shutdown('STARTUP_ERROR');
-  });
-} catch (error) {
-  logger.error('Fatal error during bot startup:', error);
-  process.exit(1);
+process.on(
+    "unhandledRejection",
+    error => {
+        console.error(
+            "UNHANDLED REJECTION:",
+            error
+        );
+    }
+);
+
+process.on(
+    "uncaughtException",
+    error => {
+        console.error(
+            "UNCAUGHT EXCEPTION:",
+            error
+        );
+    }
+);
+
+/*
+==================================================
+LOGIN
+==================================================
+*/
+
+if (!process.env.TOKEN) {
+    console.error(
+        "TOKEN is missing from .env"
+    );
+
+    process.exit(1);
 }
 
-export default TitanBot;
+client.login(
+    process.env.TOKEN
+);
